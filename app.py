@@ -1,21 +1,72 @@
 # app.py
+import os
+import importlib.util
 import streamlit as st
 import numpy as np
 import matplotlib.pyplot as plt
 from io import BytesIO, StringIO
 from scipy import integrate
 
-# Import from your local module file shipped with the project
-# (Make sure REQPY_Module.py sits next to this app.py)
-from REQPY_Module import REQPYrotdnn, REQPY_single
-
 st.set_page_config(page_title="REQPY Spectral Matching", layout="wide")
 st.title("REQPY Spectral Matching")
+
+# -----------------------------------------------------------------------------
+# Robust import of REQPY_Module (works on Streamlit Cloud, local, or /mnt/data)
+# -----------------------------------------------------------------------------
+def import_reqpy_module():
+    """
+    Try to import REQPY_Module by:
+      1) standard import,
+      2) loading from common absolute/relative paths.
+
+    If found, returns (REQPYrotdnn, REQPY_single). Otherwise raises ImportError.
+    """
+    # 1) Standard import
+    try:
+        from REQPY_Module import REQPYrotdnn, REQPY_single
+        return REQPYrotdnn, REQPY_single
+    except Exception:
+        pass
+
+    # 2) Try file-based import from common paths
+    candidate_paths = [
+        os.environ.get("APP_REQPY_PATH", "").strip(), # optional env var
+        "REQPY_Module.py",
+        "./REQPY_Module.py",
+        "/app/REQPY_Module.py",         # some Streamlit Cloud layouts
+        "/mount/src/response-spectrum/REQPY_Module.py",
+        "/home/appuser/REQPY_Module.py",
+        "/mnt/data/REQPY_Module.py",    # path used in your upload
+    ]
+    candidate_paths = [p for p in candidate_paths if p]  # drop empties
+
+    for path in candidate_paths:
+        if os.path.exists(path):
+            try:
+                spec = importlib.util.spec_from_file_location("REQPY_Module", path)
+                mod = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(mod)  # type: ignore
+                return mod.REQPYrotdnn, mod.REQPY_single
+            except Exception as e:
+                # keep trying others
+                continue
+
+    # If we get here, we failed all attempts
+    raise ImportError(
+        "Could not import REQPY_Module. Place REQPY_Module.py next to app.py, "
+        "or set APP_REQPY_PATH to its absolute path."
+    )
+
+try:
+    REQPYrotdnn, REQPY_single = import_reqpy_module()
+except ImportError as e:
+    st.error(str(e))
+    st.stop()
 
 st.markdown(
     """
 Upload a seed motion (one or two components) and a target spectrum, set parameters,
-then run spectral matching. The app will plot spectra and time histories and let
+then run spectral matching. The app plots spectra and time histories and lets
 you download matched series and figures.
 """
 )
@@ -39,7 +90,6 @@ T1 = st.sidebar.number_input("Match range start T1 [s]", min_value=0.0, max_valu
 T2 = st.sidebar.number_input("Match range end T2 [s]", min_value=0.0, max_value=20.0, value=6.0, step=0.01)
 nit = st.sidebar.number_input("Max iterations", min_value=1, max_value=100, value=15, step=1)
 NS = st.sidebar.number_input("Number of wavelet scales (NS)", min_value=50, max_value=800, value=100, step=10)
-
 percentile = st.sidebar.selectbox("RotD percentile (for 2-component)", options=[100, 90, 75, 50], index=0)
 
 run_btn = st.sidebar.button("Run Matching")
@@ -61,7 +111,7 @@ def load_seed(file, default_dt):
     else:
         t = arr[:, 0].astype(float)
         s = arr[:, 1].astype(float)
-        dt = float(np.median(np.diff(t)))  # robust in case of minor irregularities
+        dt = float(np.median(np.diff(t)))  # robust to tiny irregularities
     fs = 1.0 / dt
     return s, dt, fs
 
@@ -156,13 +206,12 @@ if run_btn:
                                file_name="spectra_rotd.png")
 
         # ===== Time histories (acc, vel, disp) for both components =====
-        # Original velocity & displacement from seeds (for comparison)
         v1 = integrate.cumulative_trapezoid(s1, dx=dt, initial=0)
         d1 = integrate.cumulative_trapezoid(v1, dx=dt, initial=0)
         v2 = integrate.cumulative_trapezoid(s2, dx=dt, initial=0)
         d2 = integrate.cumulative_trapezoid(v2, dx=dt, initial=0)
 
-        # scale originals to similar norms (mirrors module visuals)
+        # scale originals to similar norms
         sf1 = (np.linalg.norm(cvel1) / max(np.linalg.norm(v1), 1e-12))
         sf2 = (np.linalg.norm(cvel2) / max(np.linalg.norm(v2), 1e-12))
 
@@ -295,7 +344,6 @@ if run_btn:
 # Footer note
 # ----------------------------
 st.caption(
-    "Notes: For single-column seed files (acc only), set dt in the sidebar. "
-    "For two-column seed files, dt is inferred from the time column. "
-    "Ensure REQPY_Module.py is in the same folder as app.py."
+    "Notes: Place REQPY_Module.py next to app.py (recommended), or set environment "
+    "variable APP_REQPY_PATH to its absolute path. For 1-column seed files, set dt in the sidebar."
 )
