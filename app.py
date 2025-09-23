@@ -5,6 +5,7 @@ import importlib.util
 from io import BytesIO, StringIO
 
 import numpy as np
+import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
 from scipy import integrate
@@ -66,8 +67,11 @@ st.markdown(
 # -----------------------------------------------------------------------------
 st.sidebar.header("Inputs")
 
-seed_file1 = st.sidebar.file_uploader("Seed Record 1", type=["txt", "AT2"], key="seed1")
-seed_file2 = st.sidebar.file_uploader("Seed Record 2 (optional for RotDnn)", type=["txt", "AT2"], key="seed2")
+# Accept TXT, AT2, CSV for seed components
+seed_file1 = st.sidebar.file_uploader("Seed Record 1", type=["txt", "AT2", "csv"], key="seed1")
+seed_file2 = st.sidebar.file_uploader("Seed Record 2 (optional for RotDnn)", type=["txt", "AT2", "csv"], key="seed2")
+
+# Accept TXT/CSV for target spectrum
 target_file = st.sidebar.file_uploader("Target Spectrum (2 cols: T[s], PSA[g])", type=["txt", "csv"], key="target")
 
 st.sidebar.markdown("**If your seed files are single-column (acc only), set dt here:**")
@@ -109,8 +113,6 @@ def load_target(file):
       - TXT with whitespace
       - Ignores header/comment lines that don't start with numbers
     """
-    from io import StringIO as _SIO
-
     raw = file.read()
     text = raw.decode("utf-8", errors="ignore").strip()
 
@@ -120,7 +122,6 @@ def load_target(file):
         s = ln.strip()
         if not s:
             continue
-        # Try to parse the first token (comma or space separated) as a float
         token = s.split(",")[0].split()[0]
         try:
             float(token)
@@ -130,11 +131,11 @@ def load_target(file):
 
     cleaned = "\n".join(lines)
 
-    # Try as CSV first, then fallback to whitespace
+    # Try comma-delimited first; fallback to whitespace
     try:
-        arr = np.loadtxt(_SIO(cleaned), delimiter=",")
+        arr = np.loadtxt(StringIO(cleaned), delimiter=",")
     except Exception:
-        arr = np.loadtxt(_SIO(cleaned))
+        arr = np.loadtxt(StringIO(cleaned))
 
     if arr.ndim == 1 and arr.size >= 2:
         arr = arr.reshape(-1, 2)
@@ -149,17 +150,37 @@ def load_target(file):
     order = np.argsort(To)
     return To[order], dso[order]
 
+def _read_numeric_table(text):
+    """
+    Utility to read a numeric table from text that may be CSV or whitespace separated.
+    Returns np.ndarray.
+    """
+    # Try pandas first (handles headers gracefully)
+    try:
+        df = pd.read_csv(StringIO(text))
+        return df.values
+    except Exception:
+        pass
+    # Try CSV via numpy
+    try:
+        arr = np.loadtxt(StringIO(text), delimiter=",")
+        return arr
+    except Exception:
+        pass
+    # Fallback: whitespace
+    return np.loadtxt(StringIO(text))
+
 def load_seed(file, default_dt):
     """
-    Supports:
+    Supports seed formats:
       - PEER/NGA .AT2 files with headers (PEER, NPTS=..., DT=...) and wrapped columns
-      - 2-col files: [time(s), acc(g)]
-      - 1-col files: [acc(g)]  -> uses default_dt from sidebar
+      - 2-col TXT/CSV: [time(s), acc(g)]
+      - 1-col TXT/CSV: [acc(g)]  -> uses default_dt from sidebar
     Returns: s (acc in g), dt (s), fs (Hz)
     """
     raw = file.read()
     text = raw.decode("latin-1", errors="ignore")
-    head = text[:400].upper()
+    head = text[:500].upper()
 
     # --- AT2 / PEER header path ---
     if (file.name and file.name.upper().endswith(".AT2")) or ("PEER" in head) or ("NPTS" in head and "DT" in head):
@@ -177,24 +198,25 @@ def load_seed(file, default_dt):
                 break
         data_str = "\n".join(lines[start_idx:])
 
-        # Robust read for wrapped columns
+        # Robust read for wrapped columns (whitespace-separated numbers)
         s = np.fromstring(data_str, sep=" ", dtype=float).astype(float)
         fs = 1.0 / dt
         return s, dt, fs
 
-    # --- Plain numeric path (1-col or 2-col) ---
-    try:
-        arr = np.loadtxt(StringIO(text))
-    except Exception as e:
-        raise ValueError(f"Failed to parse numeric seed file: {e}")
+    # --- CSV/TXT numeric path (1-col or 2-col) ---
+    arr = _read_numeric_table(text)
 
-    if arr.ndim == 1:  # 1-col acc
-        s = arr.astype(float)
+    # Normalize to 2D
+    if np.ndim(arr) == 1:
+        arr = np.asarray(arr).reshape(-1, 1)
+
+    if arr.shape[1] == 1:  # 1-col acceleration
+        s = arr[:, 0].astype(float)
         dt = float(default_dt)
-    else:
-        # assume [time, acc] in first two columns
+    else:  # assume first two columns are [time, acc]
         t = arr[:, 0].astype(float)
         s = arr[:, 1].astype(float)
+        # robust dt in case of tiny irregularities
         dt = float(np.median(np.diff(t)))
     fs = 1.0 / dt
     return s, dt, fs
@@ -415,6 +437,6 @@ if run_btn:
 # Footer
 st.caption(
     "Notes: Place REQPY_Module.py next to app.py (recommended) or set APP_REQPY_PATH to its absolute path. "
-    "AT2 files are auto-detected (DT read from header). CSV/TXT targets can include a 'T,PSA' header; "
-    "the loader skips non-numeric lines automatically."
+    "AT2 files are auto-detected (DT read from header). Seed upload accepts AT2/TXT/CSV; "
+    "targets accept TXT/CSV with optional 'T,PSA' header."
 )
