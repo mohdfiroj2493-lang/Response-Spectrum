@@ -1,26 +1,21 @@
 # app.py
 import os
+import re
 import importlib.util
-import streamlit as st
-import numpy as np
-import matplotlib.pyplot as plt
 from io import BytesIO, StringIO
+
+import numpy as np
+import streamlit as st
+import matplotlib.pyplot as plt
 from scipy import integrate
 
 st.set_page_config(page_title="REQPY Spectral Matching", layout="wide")
 st.title("REQPY Spectral Matching")
 
 # -----------------------------------------------------------------------------
-# Robust import of REQPY_Module (works on Streamlit Cloud, local, or /mnt/data)
+# Robust import of REQPY_Module (standard import, env var, common paths, /mnt/data)
 # -----------------------------------------------------------------------------
 def import_reqpy_module():
-    """
-    Try to import REQPY_Module by:
-      1) standard import,
-      2) loading from common absolute/relative paths.
-
-    If found, returns (REQPYrotdnn, REQPY_single). Otherwise raises ImportError.
-    """
     # 1) Standard import
     try:
         from REQPY_Module import REQPYrotdnn, REQPY_single
@@ -28,30 +23,30 @@ def import_reqpy_module():
     except Exception:
         pass
 
-    # 2) Try file-based import from common paths
+    # 2) File-based import from candidate paths
     candidate_paths = [
-        os.environ.get("APP_REQPY_PATH", "").strip(), # optional env var
+        os.environ.get("APP_REQPY_PATH", "").strip(),
         "REQPY_Module.py",
         "./REQPY_Module.py",
-        "/app/REQPY_Module.py",         # some Streamlit Cloud layouts
+        "/app/REQPY_Module.py",
         "/mount/src/response-spectrum/REQPY_Module.py",
         "/home/appuser/REQPY_Module.py",
-        "/mnt/data/REQPY_Module.py",    # path used in your upload
+        "/mnt/data/REQPY_Module.py",  # common in this environment
     ]
-    candidate_paths = [p for p in candidate_paths if p]  # drop empties
+    candidate_paths = [p for p in candidate_paths if p]
 
     for path in candidate_paths:
         if os.path.exists(path):
             try:
                 spec = importlib.util.spec_from_file_location("REQPY_Module", path)
                 mod = importlib.util.module_from_spec(spec)
-                spec.loader.exec_module(mod)  # type: ignore
+                assert spec.loader is not None
+                spec.loader.exec_module(mod)
                 return mod.REQPYrotdnn, mod.REQPY_single
-            except Exception as e:
-                # keep trying others
+            except Exception:
                 continue
 
-    # If we get here, we failed all attempts
+    # If we get here, all attempts failed
     raise ImportError(
         "Could not import REQPY_Module. Place REQPY_Module.py next to app.py, "
         "or set APP_REQPY_PATH to its absolute path."
@@ -64,16 +59,14 @@ except ImportError as e:
     st.stop()
 
 st.markdown(
-    """
-Upload a seed motion (one or two components) and a target spectrum, set parameters,
-then run spectral matching. The app plots spectra and time histories and lets
-you download matched series and figures.
-"""
+    "Upload a seed motion (one or two components) and a target spectrum, set parameters, "
+    "then run spectral matching. The app plots spectra and time histories and lets you "
+    "download matched series and figures."
 )
 
-# ----------------------------
+# -----------------------------------------------------------------------------
 # Sidebar — Inputs
-# ----------------------------
+# -----------------------------------------------------------------------------
 st.sidebar.header("Inputs")
 
 seed_file1 = st.sidebar.file_uploader("Seed Record 1", type=["txt", "AT2"], key="seed1")
@@ -94,38 +87,9 @@ percentile = st.sidebar.selectbox("RotD percentile (for 2-component)", options=[
 
 run_btn = st.sidebar.button("Run Matching")
 
-# ----------------------------
+# -----------------------------------------------------------------------------
 # Helpers
-# ----------------------------
-def load_seed(file, default_dt):
-    """
-    Accepts:
-      - 2-col (t, acc[g]) or multi-col (col0=time, col1=acc)
-      - 1-col acc[g] only (uses default_dt)
-    Returns: s (acc[g]), dt (s), fs (Hz)
-    """
-    arr = np.loadtxt(file)
-    if arr.ndim == 1:  # single column: acceleration only
-        s = arr.astype(float)
-        dt = float(default_dt)
-    else:
-        t = arr[:, 0].astype(float)
-        s = arr[:, 1].astype(float)
-        dt = float(np.median(np.diff(t)))  # robust to tiny irregularities
-    fs = 1.0 / dt
-    return s, dt, fs
-
-def load_target(file):
-    """
-    Target spectrum: 2 columns (T[s], PSA[g])
-    """
-    tso = np.loadtxt(file)
-    if tso.ndim == 1 or tso.shape[1] < 2:
-        raise ValueError("Target spectrum must have 2 columns: T[s], PSA[g].")
-    To = tso[:, 0].astype(float)
-    dso = tso[:, 1].astype(float)
-    return To, dso
-
+# -----------------------------------------------------------------------------
 def fig_to_png_bytes(fig):
     buf = BytesIO()
     fig.savefig(buf, format="png", dpi=180, bbox_inches="tight")
@@ -138,43 +102,124 @@ def series_to_txt_bytes(series, dt):
     np.savetxt(sio, series, header=header)
     return sio.getvalue().encode("utf-8")
 
-# ----------------------------
+def load_target(file):
+    """
+    Target spectrum: 2 columns (T[s], PSA[g]); whitespace-separated; header lines optional if prefixed '#'.
+    """
+    try:
+        tso = np.loadtxt(file)
+    except Exception:
+        # If there are comment headers, rewind into text and try again
+        text = file.read().decode("latin-1", errors="ignore")
+        tso = np.loadtxt(StringIO(text))
+    if tso.ndim == 1 or tso.shape[1] < 2:
+        raise ValueError("Target spectrum must have 2 columns: T[s], PSA[g].")
+    To = tso[:, 0].astype(float)
+    dso = tso[:, 1].astype(float)
+    return To, dso
+
+def load_seed(file, default_dt):
+    """
+    Supports:
+      - PEER/NGA .AT2 files with headers (PEER, NPTS=..., DT=...) and wrapped columns
+      - 2-col files: [time(s), acc(g)]
+      - 1-col files: [acc(g)]  -> uses default_dt from sidebar
+    Returns: s (acc in g), dt (s), fs (Hz)
+    """
+    raw = file.read()
+    text = raw.decode("latin-1", errors="ignore")
+    head = text[:400].upper()
+
+    # --- AT2 / PEER header path ---
+    if (file.name and file.name.upper().endswith(".AT2")) or ("PEER" in head) or ("NPTS" in head and "DT" in head):
+        # Extract DT (e.g., "NPTS= 7814, DT= 0.005 SEC")
+        m = re.search(r"DT\s*=\s*([0-9.+\-Ee]+)", text)
+        if not m:
+            raise ValueError("AT2 header found but DT= missing.")
+        dt = float(m.group(1))
+
+        # Start numeric data after the line containing NPTS
+        lines = text.splitlines()
+        start_idx = 0
+        for i, line in enumerate(lines):
+            if "NPTS" in line.upper():
+                start_idx = i + 1
+                break
+        data_str = "\n".join(lines[start_idx:])
+
+        # Robust read for wrapped columns: read all whitespace-separated numbers
+        s = np.fromstring(data_str, sep=" ", dtype=float).astype(float)
+        fs = 1.0 / dt
+        return s, dt, fs
+
+    # --- Plain numeric path (1-col or 2-col) ---
+    try:
+        arr = np.loadtxt(StringIO(text))
+    except Exception as e:
+        raise ValueError(f"Failed to parse numeric seed file: {e}")
+
+    if arr.ndim == 1:  # 1-col acc
+        s = arr.astype(float)
+        dt = float(default_dt)
+    else:
+        # assume [time, acc] in first two columns
+        t = arr[:, 0].astype(float)
+        s = arr[:, 1].astype(float)
+        dt = float(np.median(np.diff(t)))
+    fs = 1.0 / dt
+    return s, dt, fs
+
+# -----------------------------------------------------------------------------
+# Optional: small diagnostics expander
+# -----------------------------------------------------------------------------
+with st.expander("Environment diagnostics (optional)"):
+    st.code(
+        "CWD: " + os.getcwd() + "\n"
+        "APP_REQPY_PATH: " + str(os.environ.get("APP_REQPY_PATH", "")) + "\n"
+        "REQPY present next to app.py: " + str(os.path.exists('REQPY_Module.py')) + "\n"
+        "REQPY present in /mnt/data: " + str(os.path.exists('/mnt/data/REQPY_Module.py')),
+        language="bash",
+    )
+
+# -----------------------------------------------------------------------------
 # Main
-# ----------------------------
+# -----------------------------------------------------------------------------
 if run_btn:
     if (seed_file1 is None) or (target_file is None):
         st.error("Please upload at least Seed Record 1 and a Target Spectrum.")
         st.stop()
 
+    # Load target
     try:
         To, dso = load_target(target_file)
     except Exception as e:
         st.error(f"Failed to read target spectrum: {e}")
         st.stop()
 
-    # Load Seed 1
+    # Load seed 1
     try:
         s1, dt1, fs1 = load_seed(seed_file1, dt_single)
     except Exception as e:
         st.error(f"Failed to read Seed Record 1: {e}")
         st.stop()
 
-    # Two-component (RotDnn) branch
+    # Two-component branch
     if seed_file2 is not None:
+        # Load seed 2
         try:
-            s2, dt2, fs2 = load_seed(seed_file2, dt1)  # align dt to seed1 if needed
+            # Use dt1 as default to keep alignment if seed2 is 1-col
+            s2, dt2, fs2 = load_seed(seed_file2, dt1)
         except Exception as e:
             st.error(f"Failed to read Seed Record 2: {e}")
             st.stop()
 
-        # enforce same length / dt
+        # Enforce same length and dt
         n = min(len(s1), len(s2))
-        s1 = s1[:n]
-        s2 = s2[:n]
+        s1, s2 = s1[:n], s2[:n]
         dt = float(dt1)
         fs = 1.0 / dt
 
-        # ===== Run RotDnn matching =====
+        # Run RotDnn matching
         try:
             (scc1, scc2, cvel1, cvel2, cdisp1, cdisp2,
              PSArotnn, PSArotnnor, T, meanefin, rmsefin) = REQPYrotdnn(
@@ -190,7 +235,7 @@ if run_btn:
 
         st.success(f"Two-Component match complete — RMSE: {rmsefin:.2f}%, Misfit: {meanefin:.2f}%")
 
-        # ===== Spectra plot =====
+        # Spectra plot
         colS1, colS2 = st.columns([1, 1])
         with colS1:
             st.subheader("RotD Spectra")
@@ -205,16 +250,15 @@ if run_btn:
             st.download_button("Download spectra plot (PNG)", data=fig_to_png_bytes(fig),
                                file_name="spectra_rotd.png")
 
-        # ===== Time histories (acc, vel, disp) for both components =====
+        # Time histories (acc, vel, disp) for both components
         v1 = integrate.cumulative_trapezoid(s1, dx=dt, initial=0)
         d1 = integrate.cumulative_trapezoid(v1, dx=dt, initial=0)
         v2 = integrate.cumulative_trapezoid(s2, dx=dt, initial=0)
         d2 = integrate.cumulative_trapezoid(v2, dx=dt, initial=0)
 
-        # scale originals to similar norms
+        # Scale originals to match norms (for visual comparison)
         sf1 = (np.linalg.norm(cvel1) / max(np.linalg.norm(v1), 1e-12))
         sf2 = (np.linalg.norm(cvel2) / max(np.linalg.norm(v2), 1e-12))
-
         t = np.linspace(0, (len(s1) - 1) * dt, len(s1))
 
         def plot_component(title, s_orig, v_orig, d_orig, s_mat, v_mat, d_mat, sf, comp_tag):
@@ -266,7 +310,7 @@ if run_btn:
         dt = float(dt1)
         fs = float(fs1)
 
-        # ===== Run single-component matching =====
+        # Run single-component matching
         try:
             (ccs, rmse, misfit, cvel, cdisp,
              PSAccs, PSAs, T, sf) = REQPY_single(
@@ -282,7 +326,7 @@ if run_btn:
 
         st.success(f"Single-Component match complete — RMSE: {rmse:.2f}%, Misfit: {misfit:.2f}%")
 
-        # ===== Spectra plot =====
+        # Spectra plot
         colS1, colS2 = st.columns([1, 1])
         with colS1:
             st.subheader("Spectra (PSA)")
@@ -302,7 +346,7 @@ if run_btn:
             st.download_button("Download matched record (TXT)", data=series_to_txt_bytes(ccs, dt),
                                file_name="matched_single.txt")
 
-        # ===== Time histories =====
+        # Time histories
         t = np.linspace(0, (len(s1) - 1) * dt, len(s1))
         v_orig = integrate.cumulative_trapezoid(s1, dx=dt, initial=0)
         d_orig = integrate.cumulative_trapezoid(v_orig, dx=dt, initial=0)
@@ -340,10 +384,8 @@ if run_btn:
         st.download_button("Download disp plot (PNG)", data=fig_to_png_bytes(fig_d),
                            file_name="timehistory_disp.png")
 
-# ----------------------------
-# Footer note
-# ----------------------------
+# Footer
 st.caption(
-    "Notes: Place REQPY_Module.py next to app.py (recommended), or set environment "
-    "variable APP_REQPY_PATH to its absolute path. For 1-column seed files, set dt in the sidebar."
+    "Notes: Place REQPY_Module.py next to app.py (recommended) or set APP_REQPY_PATH to its absolute path. "
+    "For 1-column seed files, set dt in the sidebar. AT2 files are auto-detected; DT is read from the header."
 )
