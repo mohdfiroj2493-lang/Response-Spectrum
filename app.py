@@ -16,14 +16,12 @@ st.title("REQPY Spectral Matching")
 # Robust import of REQPY_Module (standard import, env var, common paths, /mnt/data)
 # -----------------------------------------------------------------------------
 def import_reqpy_module():
-    # 1) Standard import
     try:
-        from REQPY_Module import REQPYrotdnn, REQPY_single
+        from REQPY_Module import REQPYrotdnn, REQPY_single  # type: ignore
         return REQPYrotdnn, REQPY_single
     except Exception:
         pass
 
-    # 2) File-based import from candidate paths
     candidate_paths = [
         os.environ.get("APP_REQPY_PATH", "").strip(),
         "REQPY_Module.py",
@@ -31,7 +29,7 @@ def import_reqpy_module():
         "/app/REQPY_Module.py",
         "/mount/src/response-spectrum/REQPY_Module.py",
         "/home/appuser/REQPY_Module.py",
-        "/mnt/data/REQPY_Module.py",  # common in this environment
+        "/mnt/data/REQPY_Module.py",
     ]
     candidate_paths = [p for p in candidate_paths if p]
 
@@ -41,12 +39,11 @@ def import_reqpy_module():
                 spec = importlib.util.spec_from_file_location("REQPY_Module", path)
                 mod = importlib.util.module_from_spec(spec)
                 assert spec.loader is not None
-                spec.loader.exec_module(mod)
+                spec.loader.exec_module(mod)  # type: ignore
                 return mod.REQPYrotdnn, mod.REQPY_single
             except Exception:
                 continue
 
-    # If we get here, all attempts failed
     raise ImportError(
         "Could not import REQPY_Module. Place REQPY_Module.py next to app.py, "
         "or set APP_REQPY_PATH to its absolute path."
@@ -104,19 +101,53 @@ def series_to_txt_bytes(series, dt):
 
 def load_target(file):
     """
-    Target spectrum: 2 columns (T[s], PSA[g]); whitespace-separated; header lines optional if prefixed '#'.
+    Reads a target spectrum as two numeric columns:
+      col1 = Period T [s], col2 = PSA [g]
+
+    Supports:
+      - CSV with commas (with/without header like 'T,PSA')
+      - TXT with whitespace
+      - Ignores header/comment lines that don't start with numbers
     """
+    from io import StringIO as _SIO
+
+    raw = file.read()
+    text = raw.decode("utf-8", errors="ignore").strip()
+
+    # Keep only lines that start with a number; drop headers like "T,PSA"
+    lines = []
+    for ln in text.splitlines():
+        s = ln.strip()
+        if not s:
+            continue
+        # Try to parse the first token (comma or space separated) as a float
+        token = s.split(",")[0].split()[0]
+        try:
+            float(token)
+            lines.append(s)
+        except Exception:
+            continue
+
+    cleaned = "\n".join(lines)
+
+    # Try as CSV first, then fallback to whitespace
     try:
-        tso = np.loadtxt(file)
+        arr = np.loadtxt(_SIO(cleaned), delimiter=",")
     except Exception:
-        # If there are comment headers, rewind into text and try again
-        text = file.read().decode("latin-1", errors="ignore")
-        tso = np.loadtxt(StringIO(text))
-    if tso.ndim == 1 or tso.shape[1] < 2:
-        raise ValueError("Target spectrum must have 2 columns: T[s], PSA[g].")
-    To = tso[:, 0].astype(float)
-    dso = tso[:, 1].astype(float)
-    return To, dso
+        arr = np.loadtxt(_SIO(cleaned))
+
+    if arr.ndim == 1 and arr.size >= 2:
+        arr = arr.reshape(-1, 2)
+
+    if arr.ndim != 2 or arr.shape[1] < 2:
+        raise ValueError("Target spectrum must have two numeric columns: T[s], PSA[g].")
+
+    To = arr[:, 0].astype(float)
+    dso = arr[:, 1].astype(float)
+
+    # Sort by period just in case
+    order = np.argsort(To)
+    return To[order], dso[order]
 
 def load_seed(file, default_dt):
     """
@@ -132,7 +163,6 @@ def load_seed(file, default_dt):
 
     # --- AT2 / PEER header path ---
     if (file.name and file.name.upper().endswith(".AT2")) or ("PEER" in head) or ("NPTS" in head and "DT" in head):
-        # Extract DT (e.g., "NPTS= 7814, DT= 0.005 SEC")
         m = re.search(r"DT\s*=\s*([0-9.+\-Ee]+)", text)
         if not m:
             raise ValueError("AT2 header found but DT= missing.")
@@ -147,7 +177,7 @@ def load_seed(file, default_dt):
                 break
         data_str = "\n".join(lines[start_idx:])
 
-        # Robust read for wrapped columns: read all whitespace-separated numbers
+        # Robust read for wrapped columns
         s = np.fromstring(data_str, sep=" ", dtype=float).astype(float)
         fs = 1.0 / dt
         return s, dt, fs
@@ -170,7 +200,7 @@ def load_seed(file, default_dt):
     return s, dt, fs
 
 # -----------------------------------------------------------------------------
-# Optional: small diagnostics expander
+# Optional diagnostics
 # -----------------------------------------------------------------------------
 with st.expander("Environment diagnostics (optional)"):
     st.code(
@@ -207,7 +237,6 @@ if run_btn:
     if seed_file2 is not None:
         # Load seed 2
         try:
-            # Use dt1 as default to keep alignment if seed2 is 1-col
             s2, dt2, fs2 = load_seed(seed_file2, dt1)
         except Exception as e:
             st.error(f"Failed to read Seed Record 2: {e}")
@@ -250,13 +279,12 @@ if run_btn:
             st.download_button("Download spectra plot (PNG)", data=fig_to_png_bytes(fig),
                                file_name="spectra_rotd.png")
 
-        # Time histories (acc, vel, disp) for both components
+        # Time histories
         v1 = integrate.cumulative_trapezoid(s1, dx=dt, initial=0)
         d1 = integrate.cumulative_trapezoid(v1, dx=dt, initial=0)
         v2 = integrate.cumulative_trapezoid(s2, dx=dt, initial=0)
         d2 = integrate.cumulative_trapezoid(v2, dx=dt, initial=0)
 
-        # Scale originals to match norms (for visual comparison)
         sf1 = (np.linalg.norm(cvel1) / max(np.linalg.norm(v1), 1e-12))
         sf2 = (np.linalg.norm(cvel2) / max(np.linalg.norm(v2), 1e-12))
         t = np.linspace(0, (len(s1) - 1) * dt, len(s1))
@@ -387,5 +415,6 @@ if run_btn:
 # Footer
 st.caption(
     "Notes: Place REQPY_Module.py next to app.py (recommended) or set APP_REQPY_PATH to its absolute path. "
-    "For 1-column seed files, set dt in the sidebar. AT2 files are auto-detected; DT is read from the header."
+    "AT2 files are auto-detected (DT read from header). CSV/TXT targets can include a 'T,PSA' header; "
+    "the loader skips non-numeric lines automatically."
 )
