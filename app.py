@@ -10,8 +10,8 @@ import streamlit as st
 from scipy import integrate
 import plotly.graph_objects as go
 
-st.set_page_config(page_title="REQPY Spectral Matching", layout="wide")
-st.title("REQPY Spectral Matching (interactive)")
+st.set_page_config(page_title="Spectral Matching", layout="wide")
+st.title("Spectral Matching")
 
 # -----------------------------------------------------------------------------
 # Robust import of REQPY_Module (standard import, env var, common paths, /mnt/data)
