@@ -7,11 +7,11 @@ from io import BytesIO, StringIO
 import numpy as np
 import pandas as pd
 import streamlit as st
-import matplotlib.pyplot as plt
 from scipy import integrate
+import plotly.graph_objects as go
 
-st.set_page_config(page_title="Spectral Matching", layout="wide")
-st.title("Spectral Matching")
+st.set_page_config(page_title="REQPY Spectral Matching", layout="wide")
+st.title("REQPY Spectral Matching (interactive)")
 
 # -----------------------------------------------------------------------------
 # Robust import of REQPY_Module (standard import, env var, common paths, /mnt/data)
@@ -58,8 +58,8 @@ except ImportError as e:
 
 st.markdown(
     "Upload a seed motion (one or two components) and a target spectrum, set parameters, "
-    "then run spectral matching. The app plots spectra and time histories and lets you "
-    "download matched series and figures."
+    "then run spectral matching. You’ll get interactive plots **and** the underlying "
+    "values as tables you can download."
 )
 
 # -----------------------------------------------------------------------------
@@ -91,17 +91,8 @@ run_btn = st.sidebar.button("Run Matching")
 # -----------------------------------------------------------------------------
 # Helpers
 # -----------------------------------------------------------------------------
-def fig_to_png_bytes(fig):
-    buf = BytesIO()
-    fig.savefig(buf, format="png", dpi=180, bbox_inches="tight")
-    buf.seek(0)
-    return buf
-
-def series_to_txt_bytes(series, dt):
-    sio = StringIO()
-    header = f"accelerations in g, dt = {dt}"
-    np.savetxt(sio, series, header=header)
-    return sio.getvalue().encode("utf-8")
+def series_to_csv_bytes(df: pd.DataFrame, name_hint="data.csv") -> bytes:
+    return df.to_csv(index=False).encode("utf-8")
 
 def load_target(file):
     """
@@ -146,28 +137,21 @@ def load_target(file):
     To = arr[:, 0].astype(float)
     dso = arr[:, 1].astype(float)
 
-    # Sort by period just in case
     order = np.argsort(To)
     return To[order], dso[order]
 
 def _read_numeric_table(text):
-    """
-    Utility to read a numeric table from text that may be CSV or whitespace separated.
-    Returns np.ndarray.
-    """
-    # Try pandas first (handles headers gracefully)
+    """Utility to read a numeric table from text that may be CSV or whitespace separated."""
     try:
         df = pd.read_csv(StringIO(text))
         return df.values
     except Exception:
         pass
-    # Try CSV via numpy
     try:
         arr = np.loadtxt(StringIO(text), delimiter=",")
         return arr
     except Exception:
         pass
-    # Fallback: whitespace
     return np.loadtxt(StringIO(text))
 
 def load_seed(file, default_dt):
@@ -182,7 +166,7 @@ def load_seed(file, default_dt):
     text = raw.decode("latin-1", errors="ignore")
     head = text[:500].upper()
 
-    # --- AT2 / PEER header path ---
+    # AT2 / PEER header path
     if (file.name and file.name.upper().endswith(".AT2")) or ("PEER" in head) or ("NPTS" in head and "DT" in head):
         m = re.search(r"DT\s*=\s*([0-9.+\-Ee]+)", text)
         if not m:
@@ -203,10 +187,8 @@ def load_seed(file, default_dt):
         fs = 1.0 / dt
         return s, dt, fs
 
-    # --- CSV/TXT numeric path (1-col or 2-col) ---
+    # CSV/TXT numeric path (1-col or 2-col)
     arr = _read_numeric_table(text)
-
-    # Normalize to 2D
     if np.ndim(arr) == 1:
         arr = np.asarray(arr).reshape(-1, 1)
 
@@ -216,10 +198,41 @@ def load_seed(file, default_dt):
     else:  # assume first two columns are [time, acc]
         t = arr[:, 0].astype(float)
         s = arr[:, 1].astype(float)
-        # robust dt in case of tiny irregularities
         dt = float(np.median(np.diff(t)))
     fs = 1.0 / dt
     return s, dt, fs
+
+def plot_spectrum_plotly(To, target, T, curves: dict, title="Response Spectrum"):
+    """curves: dict name->y (e.g., {'Original': PSAs, 'Matched': PSAccs})"""
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=To, y=target, mode="lines", name="Target"))
+    for name, y in curves.items():
+        fig.add_trace(go.Scatter(x=T, y=y, mode="lines", name=name))
+    fig.update_layout(
+        title=title,
+        xaxis_title="Period T [s]",
+        yaxis_title="PSA [g]",
+        xaxis_type="log",
+        template="plotly_white",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+        margin=dict(l=40, r=20, t=60, b=40),
+    )
+    return fig
+
+def plot_timeseries_plotly(t, series: dict, title, yaxis_title):
+    """series: dict name->y"""
+    fig = go.Figure()
+    for name, y in series.items():
+        fig.add_trace(go.Scatter(x=t, y=y, mode="lines", name=name))
+    fig.update_layout(
+        title=title,
+        xaxis_title="Time [s]",
+        yaxis_title=yaxis_title,
+        template="plotly_white",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+        margin=dict(l=40, r=20, t=60, b=40),
+    )
+    return fig
 
 # -----------------------------------------------------------------------------
 # Optional diagnostics
@@ -286,74 +299,66 @@ if run_btn:
 
         st.success(f"Two-Component match complete — RMSE: {rmsefin:.2f}%, Misfit: {meanefin:.2f}%")
 
-        # Spectra plot
-        colS1, colS2 = st.columns([1, 1])
-        with colS1:
-            st.subheader("RotD Spectra")
-            fig, ax = plt.subplots(figsize=(6, 5))
-            ax.semilogx(To, dso, lw=2, label="Target")
-            ax.semilogx(T, PSArotnnor, lw=1, label="Original RotD")
-            ax.semilogx(T, PSArotnn, lw=1, label="Matched RotD")
-            ax.set_xlabel("T [s]"); ax.set_ylabel("PSA [g]")
-            ax.legend(frameon=False)
-            ax.grid(True, which="both", ls=":")
-            st.pyplot(fig)
-            st.download_button("Download spectra plot (PNG)", data=fig_to_png_bytes(fig),
-                               file_name="spectra_rotd.png")
+        # ---------- Responsive spectrum (interactive) ----------
+        st.subheader("RotD Response Spectrum (interactive)")
+        fig_spec = plot_spectrum_plotly(To, dso, T, {
+            "Original RotD": PSArotnnor,
+            "Matched RotD": PSArotnn
+        }, title=f"RotD{int(percentile)} PSA (ζ={dampratio:.2f})")
+        st.plotly_chart(fig_spec, use_container_width=True)
 
-        # Time histories
-        v1 = integrate.cumulative_trapezoid(s1, dx=dt, initial=0)
-        d1 = integrate.cumulative_trapezoid(v1, dx=dt, initial=0)
-        v2 = integrate.cumulative_trapezoid(s2, dx=dt, initial=0)
-        d2 = integrate.cumulative_trapezoid(v2, dx=dt, initial=0)
+        # ---------- Spectrum values table & download ----------
+        df_spec = pd.DataFrame({
+            "T[s]": T,
+            "PSA_RotD_original[g]": PSArotnnor,
+            "PSA_RotD_matched[g]": PSArotnn
+        })
+        df_target = pd.DataFrame({"T[s]": To, "PSA_target[g]": dso})
+        st.markdown("**Values — Target and RotD spectra**")
+        st.dataframe(df_target.merge(df_spec, how="outer", on="T[s]").sort_values("T[s]"), use_container_width=True)
+        st.download_button("Download spectra values (CSV)",
+                           data=series_to_csv_bytes(df_target.merge(df_spec, how="outer", on="T[s]").sort_values("T[s]")),
+                           file_name="spectra_values.csv")
 
-        sf1 = (np.linalg.norm(cvel1) / max(np.linalg.norm(v1), 1e-12))
-        sf2 = (np.linalg.norm(cvel2) / max(np.linalg.norm(v2), 1e-12))
+        # ---------- Time histories (interactive) ----------
         t = np.linspace(0, (len(s1) - 1) * dt, len(s1))
 
-        def plot_component(title, s_orig, v_orig, d_orig, s_mat, v_mat, d_mat, sf, comp_tag):
-            st.subheader(title)
+        st.markdown("---")
+        st.subheader("Component 1 — Matched Time Histories (interactive)")
+        fig_c1_acc = plot_timeseries_plotly(t, {"Matched acc [g]": scc1}, "Component 1 — Acceleration", "acc [g]")
+        fig_c1_vel = plot_timeseries_plotly(t, {"Matched vel [g·s]": cvel1}, "Component 1 — Velocity", "vel [g·s]")
+        fig_c1_disp = plot_timeseries_plotly(t, {"Matched disp [g·s²]": cdisp1}, "Component 1 — Displacement", "disp [g·s²]")
+        st.plotly_chart(fig_c1_acc, use_container_width=True)
+        st.plotly_chart(fig_c1_vel, use_container_width=True)
+        st.plotly_chart(fig_c1_disp, use_container_width=True)
 
-            # acc
-            fig_a, ax_a = plt.subplots(figsize=(7, 3))
-            ax_a.plot(t, sf * s_orig, lw=0.9, label="Original (scaled)")
-            ax_a.plot(t, s_mat, lw=0.9, label="Matched")
-            ax_a.set_ylabel("acc [g]"); ax_a.set_xlabel("t [s]")
-            ax_a.legend(frameon=False); ax_a.grid(True, ls=":")
-            st.pyplot(fig_a)
-            st.download_button(f"Download {comp_tag} acc plot (PNG)", data=fig_to_png_bytes(fig_a),
-                               file_name=f"timehistory_{comp_tag}_acc.png")
-
-            # vel
-            fig_v, ax_v = plt.subplots(figsize=(7, 3))
-            ax_v.plot(t, sf * v_orig, lw=0.9, label="Original (scaled)")
-            ax_v.plot(t, v_mat, lw=0.9, label="Matched")
-            ax_v.set_ylabel("vel/g"); ax_v.set_xlabel("t [s]")
-            ax_v.legend(frameon=False); ax_v.grid(True, ls=":")
-            st.pyplot(fig_v)
-            st.download_button(f"Download {comp_tag} vel plot (PNG)", data=fig_to_png_bytes(fig_v),
-                               file_name=f"timehistory_{comp_tag}_vel.png")
-
-            # disp
-            fig_d, ax_d = plt.subplots(figsize=(7, 3))
-            ax_d.plot(t, sf * d_orig, lw=0.9, label="Original (scaled)")
-            ax_d.plot(t, d_mat, lw=0.9, label="Matched")
-            ax_d.set_ylabel("disp/g"); ax_d.set_xlabel("t [s]")
-            ax_d.legend(frameon=False); ax_d.grid(True, ls=":")
-            st.pyplot(fig_d)
-            st.download_button(f"Download {comp_tag} disp plot (PNG)", data=fig_to_png_bytes(fig_d),
-                               file_name=f"timehistory_{comp_tag}_disp.png")
-
-        with colS2:
-            st.subheader("Downloads — Matched Series")
-            st.download_button("Download matched comp1 (TXT)", data=series_to_txt_bytes(scc1, dt),
-                               file_name="matched_comp1.txt")
-            st.download_button("Download matched comp2 (TXT)", data=series_to_txt_bytes(scc2, dt),
-                               file_name="matched_comp2.txt")
+        # values & download
+        df_c1 = pd.DataFrame({"t[s]": t, "acc_matched[g]": scc1, "vel_matched[g·s]": cvel1, "disp_matched[g·s²]": cdisp1})
+        st.dataframe(df_c1, use_container_width=True, height=280)
+        st.download_button("Download Component 1 time history (CSV)", data=series_to_csv_bytes(df_c1),
+                           file_name="component1_matched_time_history.csv")
 
         st.markdown("---")
-        plot_component("Component 1 — Time Histories", s1, v1, d1, scc1, cvel1, cdisp1, sf1, "comp1")
-        plot_component("Component 2 — Time Histories", s2, v2, d2, scc2, cvel2, cdisp2, sf2, "comp2")
+        st.subheader("Component 2 — Matched Time Histories (interactive)")
+        fig_c2_acc = plot_timeseries_plotly(t, {"Matched acc [g]": scc2}, "Component 2 — Acceleration", "acc [g]")
+        fig_c2_vel = plot_timeseries_plotly(t, {"Matched vel [g·s]": cvel2}, "Component 2 — Velocity", "vel [g·s]")
+        fig_c2_disp = plot_timeseries_plotly(t, {"Matched disp [g·s²]": cdisp2}, "Component 2 — Displacement", "disp [g·s²]")
+        st.plotly_chart(fig_c2_acc, use_container_width=True)
+        st.plotly_chart(fig_c2_vel, use_container_width=True)
+        st.plotly_chart(fig_c2_disp, use_container_width=True)
+
+        df_c2 = pd.DataFrame({"t[s]": t, "acc_matched[g]": scc2, "vel_matched[g·s]": cvel2, "disp_matched[g·s²]": cdisp2})
+        st.dataframe(df_c2, use_container_width=True, height=280)
+        st.download_button("Download Component 2 time history (CSV)", data=series_to_csv_bytes(df_c2),
+                           file_name="component2_matched_time_history.csv")
+
+        # ---------- Provide matched series downloads (TXT for backward compat) ----------
+        st.markdown("---")
+        st.subheader("Downloads — Matched Series (TXT)")
+        txt_c1 = pd.Series(scc1).to_csv(index=False, header=False).encode("utf-8")
+        txt_c2 = pd.Series(scc2).to_csv(index=False, header=False).encode("utf-8")
+        st.download_button("Matched comp1 (TXT)", data=txt_c1, file_name="matched_comp1.txt")
+        st.download_button("Matched comp2 (TXT)", data=txt_c2, file_name="matched_comp2.txt")
 
     # Single-component branch
     else:
@@ -376,67 +381,50 @@ if run_btn:
 
         st.success(f"Single-Component match complete — RMSE: {rmse:.2f}%, Misfit: {misfit:.2f}%")
 
-        # Spectra plot
-        colS1, colS2 = st.columns([1, 1])
-        with colS1:
-            st.subheader("Spectra (PSA)")
-            fig, ax = plt.subplots(figsize=(6, 5))
-            ax.semilogx(To, dso, lw=2, label="Target")
-            ax.semilogx(T, PSAs, lw=1, label="Original")
-            ax.semilogx(T, PSAccs, lw=1, label="Matched")
-            ax.set_xlabel("T [s]"); ax.set_ylabel("PSA [g]")
-            ax.legend(frameon=False)
-            ax.grid(True, which="both", ls=":")
-            st.pyplot(fig)
-            st.download_button("Download spectra plot (PNG)", data=fig_to_png_bytes(fig),
-                               file_name="spectra_single.png")
+        # ---------- Responsive spectrum (interactive) ----------
+        st.subheader("Response Spectrum (interactive)")
+        fig_spec = plot_spectrum_plotly(To, dso, T, {
+            "Original": PSAs,
+            "Matched": PSAccs
+        }, title=f"PSA (ζ={dampratio:.2f})")
+        st.plotly_chart(fig_spec, use_container_width=True)
 
-        with colS2:
-            st.subheader("Download — Matched Series")
-            st.download_button("Download matched record (TXT)", data=series_to_txt_bytes(ccs, dt),
-                               file_name="matched_single.txt")
+        # ---------- Spectrum values table & download ----------
+        df_spec = pd.DataFrame({"T[s]": T, "PSA_original[g]": PSAs, "PSA_matched[g]": PSAccs})
+        df_target = pd.DataFrame({"T[s]": To, "PSA_target[g]": dso})
+        st.markdown("**Values — Target and PSA (original vs. matched)**")
+        df_merged = df_target.merge(df_spec, how="outer", on="T[s]").sort_values("T[s]")
+        st.dataframe(df_merged, use_container_width=True)
+        st.download_button("Download spectra values (CSV)", data=series_to_csv_bytes(df_merged),
+                           file_name="spectra_values.csv")
 
-        # Time histories
+        # ---------- Time histories (interactive) ----------
         t = np.linspace(0, (len(s1) - 1) * dt, len(s1))
-        v_orig = integrate.cumulative_trapezoid(s1, dx=dt, initial=0)
-        d_orig = integrate.cumulative_trapezoid(v_orig, dx=dt, initial=0)
-
         st.markdown("---")
-        st.subheader("Time Histories")
+        st.subheader("Matched Time Histories (interactive)")
 
-        # Acc
-        fig_a, ax_a = plt.subplots(figsize=(9, 3))
-        ax_a.plot(t, sf * s1, lw=0.9, label="Original (scaled)")
-        ax_a.plot(t, ccs, lw=0.9, label="Matched")
-        ax_a.set_ylabel("acc [g]"); ax_a.set_xlabel("t [s]")
-        ax_a.legend(frameon=False); ax_a.grid(True, ls=":")
-        st.pyplot(fig_a)
-        st.download_button("Download acc plot (PNG)", data=fig_to_png_bytes(fig_a),
-                           file_name="timehistory_acc.png")
+        st.plotly_chart(
+            plot_timeseries_plotly(t, {"Matched acc [g]": ccs}, "Acceleration", "acc [g]"),
+            use_container_width=True
+        )
+        st.plotly_chart(
+            plot_timeseries_plotly(t, {"Matched vel [g·s]": cvel}, "Velocity", "vel [g·s]"),
+            use_container_width=True
+        )
+        st.plotly_chart(
+            plot_timeseries_plotly(t, {"Matched disp [g·s²]": cdisp}, "Displacement", "disp [g·s²]"),
+            use_container_width=True
+        )
 
-        # Vel
-        fig_v, ax_v = plt.subplots(figsize=(9, 3))
-        ax_v.plot(t, sf * v_orig, lw=0.9, label="Original (scaled)")
-        ax_v.plot(t, cvel, lw=0.9, label="Matched")
-        ax_v.set_ylabel("vel/g"); ax_v.set_xlabel("t [s]")
-        ax_v.legend(frameon=False); ax_v.grid(True, ls=":")
-        st.pyplot(fig_v)
-        st.download_button("Download vel plot (PNG)", data=fig_to_png_bytes(fig_v),
-                           file_name="timehistory_vel.png")
-
-        # Disp
-        fig_d, ax_d = plt.subplots(figsize=(9, 3))
-        ax_d.plot(t, sf * d_orig, lw=0.9, label="Original (scaled)")
-        ax_d.plot(t, cdisp, lw=0.9, label="Matched")
-        ax_d.set_ylabel("disp/g"); ax_d.set_xlabel("t [s]")
-        ax_d.legend(frameon=False); ax_d.grid(True, ls=":")
-        st.pyplot(fig_d)
-        st.download_button("Download disp plot (PNG)", data=fig_to_png_bytes(fig_d),
-                           file_name="timehistory_disp.png")
+        # values & download
+        df_th = pd.DataFrame({"t[s]": t, "acc_matched[g]": ccs, "vel_matched[g·s]": cvel, "disp_matched[g·s²]": cdisp})
+        st.dataframe(df_th, use_container_width=True, height=280)
+        st.download_button("Download matched time history (CSV)", data=series_to_csv_bytes(df_th),
+                           file_name="matched_time_history.csv")
 
 # Footer
 st.caption(
     "Notes: Place REQPY_Module.py next to app.py (recommended) or set APP_REQPY_PATH to its absolute path. "
     "AT2 files are auto-detected (DT read from header). Seed upload accepts AT2/TXT/CSV; "
-    "targets accept TXT/CSV with optional 'T,PSA' header."
+    "targets accept TXT/CSV with optional 'T,PSA' header. Plots are Plotly-based and responsive."
 )
