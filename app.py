@@ -10,8 +10,8 @@ import streamlit as st
 import matplotlib.pyplot as plt
 from scipy import integrate
 
-st.set_page_config(page_title="REQPY Spectral Matching", layout="wide")
-st.title("REQPY Spectral Matching")
+st.set_page_config(page_title="Spectral Matching", layout="wide")
+st.title("Spectral Matching")
 
 # -----------------------------------------------------------------------------
 # Robust import of REQPY_Module (standard import, env var, common paths, /mnt/data)
