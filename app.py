@@ -91,18 +91,14 @@ run_btn = st.sidebar.button("Run Matching")
 # -----------------------------------------------------------------------------
 # Helpers
 # -----------------------------------------------------------------------------
-def series_to_csv_bytes(df: pd.DataFrame, name_hint="data.csv") -> bytes:
+def series_to_csv_bytes(df: pd.DataFrame) -> bytes:
     return df.to_csv(index=False).encode("utf-8")
 
 def load_target(file):
     """
     Reads a target spectrum as two numeric columns:
       col1 = Period T [s], col2 = PSA [g]
-
-    Supports:
-      - CSV with commas (with/without header like 'T,PSA')
-      - TXT with whitespace
-      - Ignores header/comment lines that don't start with numbers
+    Supports CSV (commas) or TXT (whitespace). Skips non-numeric header lines (e.g., 'T,PSA').
     """
     raw = file.read()
     text = raw.decode("utf-8", errors="ignore").strip()
@@ -130,7 +126,6 @@ def load_target(file):
 
     if arr.ndim == 1 and arr.size >= 2:
         arr = arr.reshape(-1, 2)
-
     if arr.ndim != 2 or arr.shape[1] < 2:
         raise ValueError("Target spectrum must have two numeric columns: T[s], PSA[g].")
 
@@ -141,7 +136,7 @@ def load_target(file):
     return To[order], dso[order]
 
 def _read_numeric_table(text):
-    """Utility to read a numeric table from text that may be CSV or whitespace separated."""
+    """Read a numeric table from text that may be CSV or whitespace separated."""
     try:
         df = pd.read_csv(StringIO(text))
         return df.values
@@ -203,7 +198,7 @@ def load_seed(file, default_dt):
     return s, dt, fs
 
 def plot_spectrum_plotly(To, target, T, curves: dict, title="Response Spectrum"):
-    """curves: dict name->y (e.g., {'Original': PSAs, 'Matched': PSAccs})"""
+    """curves: dict name->y"""
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=To, y=target, mode="lines", name="Target"))
     for name, y in curves.items():
@@ -299,7 +294,7 @@ if run_btn:
 
         st.success(f"Two-Component match complete — RMSE: {rmsefin:.2f}%, Misfit: {meanefin:.2f}%")
 
-        # ---------- Responsive spectrum (interactive) ----------
+        # ---------- Responsive spectrum ----------
         st.subheader("RotD Response Spectrum (interactive)")
         fig_spec = plot_spectrum_plotly(To, dso, T, {
             "Original RotD": PSArotnnor,
@@ -320,45 +315,83 @@ if run_btn:
                            data=series_to_csv_bytes(df_target.merge(df_spec, how="outer", on="T[s]").sort_values("T[s]")),
                            file_name="spectra_values.csv")
 
-        # ---------- Time histories (interactive) ----------
+        # ---------- ORIGINAL + MATCHED time histories ----------
+        # Build time axis
         t = np.linspace(0, (len(s1) - 1) * dt, len(s1))
+        # Originals
+        v1 = integrate.cumulative_trapezoid(s1, dx=dt, initial=0)
+        d1 = integrate.cumulative_trapezoid(v1, dx=dt, initial=0)
+        v2 = integrate.cumulative_trapezoid(s2, dx=dt, initial=0)
+        d2 = integrate.cumulative_trapezoid(v2, dx=dt, initial=0)
+        # Scale factors so original overlays visually
+        sf1 = (np.linalg.norm(cvel1) / max(np.linalg.norm(v1), 1e-12))
+        sf2 = (np.linalg.norm(cvel2) / max(np.linalg.norm(v2), 1e-12))
 
+        # Component 1
         st.markdown("---")
-        st.subheader("Component 1 — Matched Time Histories (interactive)")
-        fig_c1_acc = plot_timeseries_plotly(t, {"Matched acc [g]": scc1}, "Component 1 — Acceleration", "acc [g]")
-        fig_c1_vel = plot_timeseries_plotly(t, {"Matched vel [g·s]": cvel1}, "Component 1 — Velocity", "vel [g·s]")
-        fig_c1_disp = plot_timeseries_plotly(t, {"Matched disp [g·s²]": cdisp1}, "Component 1 — Displacement", "disp [g·s²]")
-        st.plotly_chart(fig_c1_acc, use_container_width=True)
-        st.plotly_chart(fig_c1_vel, use_container_width=True)
-        st.plotly_chart(fig_c1_disp, use_container_width=True)
-
-        # values & download
-        df_c1 = pd.DataFrame({"t[s]": t, "acc_matched[g]": scc1, "vel_matched[g·s]": cvel1, "disp_matched[g·s²]": cdisp1})
+        st.subheader("Component 1 — Time Histories (original vs. matched)")
+        st.plotly_chart(
+            plot_timeseries_plotly(t, {"Original (scaled) acc [g]": sf1*s1, "Matched acc [g]": scc1},
+                                   "Acceleration (Comp 1)", "acc [g]"),
+            use_container_width=True
+        )
+        st.plotly_chart(
+            plot_timeseries_plotly(t, {"Original (scaled) vel [g·s]": sf1*v1, "Matched vel [g·s]": cvel1},
+                                   "Velocity (Comp 1)", "vel [g·s]"),
+            use_container_width=True
+        )
+        st.plotly_chart(
+            plot_timeseries_plotly(t, {"Original (scaled) disp [g·s²]": sf1*d1, "Matched disp [g·s²]": cdisp1},
+                                   "Displacement (Comp 1)", "disp [g·s²]"),
+            use_container_width=True
+        )
+        df_c1 = pd.DataFrame({
+            "t[s]": t,
+            "acc_original_scaled[g]": sf1*s1, "acc_matched[g]": scc1,
+            "vel_original_scaled[g·s]": sf1*v1, "vel_matched[g·s]": cvel1,
+            "disp_original_scaled[g·s²]": sf1*d1, "disp_matched[g·s²]": cdisp1,
+        })
         st.dataframe(df_c1, use_container_width=True, height=280)
         st.download_button("Download Component 1 time history (CSV)", data=series_to_csv_bytes(df_c1),
-                           file_name="component1_matched_time_history.csv")
+                           file_name="component1_time_history.csv")
 
+        # Component 2
         st.markdown("---")
-        st.subheader("Component 2 — Matched Time Histories (interactive)")
-        fig_c2_acc = plot_timeseries_plotly(t, {"Matched acc [g]": scc2}, "Component 2 — Acceleration", "acc [g]")
-        fig_c2_vel = plot_timeseries_plotly(t, {"Matched vel [g·s]": cvel2}, "Component 2 — Velocity", "vel [g·s]")
-        fig_c2_disp = plot_timeseries_plotly(t, {"Matched disp [g·s²]": cdisp2}, "Component 2 — Displacement", "disp [g·s²]")
-        st.plotly_chart(fig_c2_acc, use_container_width=True)
-        st.plotly_chart(fig_c2_vel, use_container_width=True)
-        st.plotly_chart(fig_c2_disp, use_container_width=True)
-
-        df_c2 = pd.DataFrame({"t[s]": t, "acc_matched[g]": scc2, "vel_matched[g·s]": cvel2, "disp_matched[g·s²]": cdisp2})
+        st.subheader("Component 2 — Time Histories (original vs. matched)")
+        st.plotly_chart(
+            plot_timeseries_plotly(t, {"Original (scaled) acc [g]": sf2*s2, "Matched acc [g]": scc2},
+                                   "Acceleration (Comp 2)", "acc [g]"),
+            use_container_width=True
+        )
+        st.plotly_chart(
+            plot_timeseries_plotly(t, {"Original (scaled) vel [g·s]": sf2*v2, "Matched vel [g·s]": cvel2},
+                                   "Velocity (Comp 2)", "vel [g·s]"),
+            use_container_width=True
+        )
+        st.plotly_chart(
+            plot_timeseries_plotly(t, {"Original (scaled) disp [g·s²]": sf2*d2, "Matched disp [g·s²]": cdisp2},
+                                   "Displacement (Comp 2)", "disp [g·s²]"),
+            use_container_width=True
+        )
+        df_c2 = pd.DataFrame({
+            "t[s]": t,
+            "acc_original_scaled[g]": sf2*s2, "acc_matched[g]": scc2,
+            "vel_original_scaled[g·s]": sf2*v2, "vel_matched[g·s]": cvel2,
+            "disp_original_scaled[g·s²]": sf2*d2, "disp_matched[g·s²]": cdisp2,
+        })
         st.dataframe(df_c2, use_container_width=True, height=280)
         st.download_button("Download Component 2 time history (CSV)", data=series_to_csv_bytes(df_c2),
-                           file_name="component2_matched_time_history.csv")
+                           file_name="component2_time_history.csv")
 
-        # ---------- Provide matched series downloads (TXT for backward compat) ----------
+        # TXT downloads (compat)
         st.markdown("---")
         st.subheader("Downloads — Matched Series (TXT)")
-        txt_c1 = pd.Series(scc1).to_csv(index=False, header=False).encode("utf-8")
-        txt_c2 = pd.Series(scc2).to_csv(index=False, header=False).encode("utf-8")
-        st.download_button("Matched comp1 (TXT)", data=txt_c1, file_name="matched_comp1.txt")
-        st.download_button("Matched comp2 (TXT)", data=txt_c2, file_name="matched_comp2.txt")
+        st.download_button("Matched comp1 (TXT)",
+                           data=pd.Series(scc1).to_csv(index=False, header=False).encode("utf-8"),
+                           file_name="matched_comp1.txt")
+        st.download_button("Matched comp2 (TXT)",
+                           data=pd.Series(scc2).to_csv(index=False, header=False).encode("utf-8"),
+                           file_name="matched_comp2.txt")
 
     # Single-component branch
     else:
@@ -381,7 +414,7 @@ if run_btn:
 
         st.success(f"Single-Component match complete — RMSE: {rmse:.2f}%, Misfit: {misfit:.2f}%")
 
-        # ---------- Responsive spectrum (interactive) ----------
+        # ---------- Responsive spectrum ----------
         st.subheader("Response Spectrum (interactive)")
         fig_spec = plot_spectrum_plotly(To, dso, T, {
             "Original": PSAs,
@@ -398,26 +431,35 @@ if run_btn:
         st.download_button("Download spectra values (CSV)", data=series_to_csv_bytes(df_merged),
                            file_name="spectra_values.csv")
 
-        # ---------- Time histories (interactive) ----------
+        # ---------- ORIGINAL + MATCHED time histories ----------
         t = np.linspace(0, (len(s1) - 1) * dt, len(s1))
+        v_orig = integrate.cumulative_trapezoid(s1, dx=dt, initial=0)
+        d_orig = integrate.cumulative_trapezoid(v_orig, dx=dt, initial=0)
+
         st.markdown("---")
-        st.subheader("Matched Time Histories (interactive)")
+        st.subheader("Time Histories (original vs. matched)")
+        st.plotly_chart(
+            plot_timeseries_plotly(t, {"Original (scaled) acc [g]": sf*s1, "Matched acc [g]": ccs},
+                                   "Acceleration", "acc [g]"),
+            use_container_width=True
+        )
+        st.plotly_chart(
+            plot_timeseries_plotly(t, {"Original (scaled) vel [g·s]": sf*v_orig, "Matched vel [g·s]": cvel},
+                                   "Velocity", "vel [g·s]"),
+            use_container_width=True
+        )
+        st.plotly_chart(
+            plot_timeseries_plotly(t, {"Original (scaled) disp [g·s²]": sf*d_orig, "Matched disp [g·s²]": cdisp},
+                                   "Displacement", "disp [g·s²]"),
+            use_container_width=True
+        )
 
-        st.plotly_chart(
-            plot_timeseries_plotly(t, {"Matched acc [g]": ccs}, "Acceleration", "acc [g]"),
-            use_container_width=True
-        )
-        st.plotly_chart(
-            plot_timeseries_plotly(t, {"Matched vel [g·s]": cvel}, "Velocity", "vel [g·s]"),
-            use_container_width=True
-        )
-        st.plotly_chart(
-            plot_timeseries_plotly(t, {"Matched disp [g·s²]": cdisp}, "Displacement", "disp [g·s²]"),
-            use_container_width=True
-        )
-
-        # values & download
-        df_th = pd.DataFrame({"t[s]": t, "acc_matched[g]": ccs, "vel_matched[g·s]": cvel, "disp_matched[g·s²]": cdisp})
+        df_th = pd.DataFrame({
+            "t[s]": t,
+            "acc_original_scaled[g]": sf*s1, "acc_matched[g]": ccs,
+            "vel_original_scaled[g·s]": sf*v_orig, "vel_matched[g·s]": cvel,
+            "disp_original_scaled[g·s²]": sf*d_orig, "disp_matched[g·s²]": cdisp,
+        })
         st.dataframe(df_th, use_container_width=True, height=280)
         st.download_button("Download matched time history (CSV)", data=series_to_csv_bytes(df_th),
                            file_name="matched_time_history.csv")
